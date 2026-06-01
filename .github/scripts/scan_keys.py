@@ -29,11 +29,11 @@ from github import Github, Auth
 #  Configuration
 # ============================
 MAX_RUNTIME_SECONDS = 5.9 * 3600   # GitHub Actions job limit is 6h, leave 6min buffer
-RATE_LIMIT_CALLS = 28              # leave 2-call headroom under the 30/min hard cap
+RATE_LIMIT_CALLS = 15              # conservative — well under 30/min, no burst
 REQUEST_TIMEOUT = 15
 PER_PAGE = 30
 VERIFY_WORKERS = 30
-SEARCH_WORKERS = 4
+SEARCH_WORKERS = 2             # fewer concurrent searchers → less burst
 CACHE_SIZE = 500
 CACHE_TTL = 1800                   # 30min TTL (shorter since we scan continuously)
 
@@ -60,7 +60,7 @@ class RateLimiter:
     def __init__(self, calls_per_minute=RATE_LIMIT_CALLS):
         self.rate = calls_per_minute / 60.0
         self.max_tokens = float(calls_per_minute)
-        self.tokens = self.max_tokens
+        self.tokens = 1.0               # cold start — 1st request immediate, then paced
         self.lock = threading.Lock()
         self.last_refill = time.time()
         self.total_waited = 0.0
@@ -522,8 +522,9 @@ def generate_time_windows(lookback_minutes=CYCLE_LOOKBACK_MINUTES,
     for i in range(0, lookback_minutes, partition_minutes):
         end = now - timedelta(minutes=i)
         start = now - timedelta(minutes=i + partition_minutes)
-        label = f"{start.strftime('%m-%d %H:%M')}→{end.strftime('%H:%M')}"
-        date_filter = f" {start.strftime('%Y-%m-%dT%H:%M')}..{end.strftime('%Y-%m-%dT%H:%M')}"
+        label = f"{start.strftime('%H:%M')}→{end.strftime('%H:%M')}"
+        # GitHub range syntax: qualifier:START..END  (no space after colon)
+        date_filter = f"{start.strftime('%Y-%m-%dT%H:%M')}..{end.strftime('%Y-%m-%dT%H:%M')}"
         windows.append((label, date_filter))
     return windows
 
