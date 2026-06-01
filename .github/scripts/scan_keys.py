@@ -20,7 +20,7 @@ import requests
 import urllib.parse
 import urllib.request
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Tuple, Dict
 from github import Github, Auth
@@ -40,7 +40,6 @@ CACHE_TTL = 1800                   # 30min TTL (shorter since we scan continuous
 # Continuous-loop tuning
 CYCLE_LOOKBACK_MINUTES = 15        # each cycle searches this many minutes back
 CYCLE_SLEEP_SECONDS = 240          # sleep 4min between cycles → ~10 cycles/hour
-CYCLE_PARTITION_MINUTES = 5        # slice width for time-partitioned searches
 
 APP_ID = os.environ.get("APP_ID")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
@@ -124,12 +123,6 @@ KEY_PATTERNS = {
 # These must contain every token that could appear in a key so GitHub Search returns the file.
 CODE_KEYWORDS = " OR ".join([
     "sk-proj-", "sk-", "sk-or-v1-", "xai-", "AIza", "sk-ant-api",
-    "r8_", "hf_", "tp-", "sk-api-",
-])
-# Issues need broader matching since people type key fragments
-ISSUE_KEYWORDS = '"your key leak" OR sk-proj- OR sk- OR sk-or-v1- OR xai- OR AIza OR sk-ant-api OR r8_ OR hf_ OR tp- OR sk-api-'
-COMMIT_KEYWORDS = " OR ".join([
-    "sk-", "sk-proj-", "sk-or-v1-", "xai-", "AIza", "sk-ant-api",
     "r8_", "hf_", "tp-", "sk-api-",
 ])
 ENV_KEYWORDS = " OR ".join([
@@ -245,11 +238,6 @@ def get_github_client():
 def safe_print(msg):
     with print_lock:
         print(msg, flush=True)
-
-def check_timeout():
-    if time.time() - start_time >= MAX_RUNTIME_SECONDS:
-        safe_print(f"\n⏰ Runtime limit ({MAX_RUNTIME_SECONDS}s) reached, exiting.")
-        sys.exit(0)
 
 def gh_headers():
     headers = {"Accept": "application/vnd.github+json", "User-Agent": random_ua()}
@@ -513,36 +501,20 @@ def verify_batch(batch):
 
 # ============================
 #  Search workers
-# ============================
-def generate_time_windows(lookback_minutes=CYCLE_LOOKBACK_MINUTES,
-                         partition_minutes=CYCLE_PARTITION_MINUTES):
-    """Yield (label, start_iso, end_iso) for each time partition."""
-    now = datetime.now(timezone.utc)
-    windows = []
-    for i in range(0, lookback_minutes, partition_minutes):
-        end = now - timedelta(minutes=i)
-        start = now - timedelta(minutes=i + partition_minutes)
-        label = f"{start.strftime('%H:%M')}→{end.strftime('%H:%M')}"
-        start_iso = start.strftime('%Y-%m-%dT%H:%M')
-        end_iso = end.strftime('%Y-%m-%dT%H:%M')
-        windows.append((label, start_iso, end_iso))
-    return windows
-
-def search_code(label):
-    """Search GitHub code (no date filter available, so single pass with indexed sort)."""
+def search_code():
+    """Search GitHub code — sorted by indexed, newest first."""
     query = CODE_KEYWORDS
     total = 0
     page = 1
     consecutive_empty = 0
     while not stop_event.is_set() and consecutive_empty < 3:
-        check_timeout()
         url = f"{GITHUB_API}/search/code?q={urllib.parse.quote(query)}&sort=indexed&order=desc&per_page={PER_PAGE}&page={page}"
         code, data = gh_api_get(url)
         if code == 403:
-            safe_print(f"  CODE 403 on page {page}, stopping")
+            safe_print(f"  CODE 403 p{page}, stopping")
             break
         if code != 200:
-            safe_print(f"  CODE HTTP {code} page {page}")
+            safe_print(f"  CODE HTTP {code} p{page}  URL: {url[:150]}")
             page += 1
             continue
         items = data.get("items", []) if isinstance(data, dict) else []
@@ -551,7 +523,7 @@ def search_code(label):
             page += 1
             continue
         consecutive_empty = 0
-        safe_print(f"  📄 [{label}] CODE p{page}: {len(items)} items (total: {total})")
+        safe_print(f"  📄 CODE p{page}: {len(items)} (total: {total})")
         for item in items:
             html_url = item.get("html_url", "")
             owner = item.get("repository", {}).get("owner", {}).get("login", "unknown")
@@ -559,76 +531,13 @@ def search_code(label):
             total += 1
         page += 1
 
-def search_issues(label):
-    """Search GitHub issues — no time filter, sorted by newest first."""
-    query = ISSUE_KEYWORDS
-    total = 0
-    page = 1
-    consecutive_empty = 0
-    while not stop_event.is_set() and consecutive_empty < 3:
-        check_timeout()
-        url = f"{GITHUB_API}/search/issues?q={urllib.parse.quote(query)}&sort=created&order=desc&per_page={PER_PAGE}&page={page}"
-        code, data = gh_api_get(url)
-        if code == 403:
-            safe_print(f"  ISSUES 403 p{page}, stopping")
-            break
-        if code != 200:
-            safe_print(f"  ISSUES HTTP {code} p{page}  URL: {url[:150]}")
-            page += 1
-            continue
-        items = data.get("items", []) if isinstance(data, dict) else []
-        if not items:
-            consecutive_empty += 1
-            page += 1
-            continue
-        consecutive_empty = 0
-        safe_print(f"  💬 [{label}] ISSUES p{page}: {len(items)} (total: {total})")
-        for item in items:
-            html_url = item.get("html_url", "")
-            author = item.get("user", {}).get("login", "unknown") if item.get("user") else "unknown"
-            yield (html_url, author, "issue")
-            total += 1
-        page += 1
-
-def search_commits(label):
-    """Search GitHub commits — no time filter, sorted by newest first."""
-    query = COMMIT_KEYWORDS
-    total = 0
-    page = 1
-    consecutive_empty = 0
-    while not stop_event.is_set() and consecutive_empty < 3:
-        check_timeout()
-        url = f"{GITHUB_API}/search/commits?q={urllib.parse.quote(query)}&sort=committer-date&order=desc&per_page={PER_PAGE}&page={page}"
-        code, data = gh_api_get(url)
-        if code == 403:
-            safe_print(f"  COMMITS 403 p{page}, stopping")
-            break
-        if code != 200:
-            safe_print(f"  COMMITS HTTP {code} p{page}  URL: {url[:150]}")
-            page += 1
-            continue
-        items = data.get("items", []) if isinstance(data, dict) else []
-        if not items:
-            consecutive_empty += 1
-            page += 1
-            continue
-        consecutive_empty = 0
-        safe_print(f"  📝 [{label}] COMMITS p{page}: {len(items)} (total: {total})")
-        for item in items:
-            html_url = item.get("html_url", "")
-            author = item.get("author", {}).get("login", "unknown") if item.get("author") else "unknown"
-            yield (html_url, author, "commit")
-            total += 1
-        page += 1
-
-def search_env_files(label):
+def search_env_files():
     """Search .env / config files — simple query, code search."""
     query = f"{ENV_KEYWORDS} filename:.env"
     total = 0
     page = 1
     consecutive_empty = 0
     while not stop_event.is_set() and consecutive_empty < 3:
-        check_timeout()
         url = f"{GITHUB_API}/search/code?q={urllib.parse.quote(query)}&per_page={PER_PAGE}&page={page}"
         code, data = gh_api_get(url)
         if code == 403:
@@ -644,7 +553,7 @@ def search_env_files(label):
             page += 1
             continue
         consecutive_empty = 0
-        safe_print(f"  📁 [{label}] ENV p{page}: {len(items)} (total: {total})")
+        safe_print(f"  📁 ENV p{page}: {len(items)} (total: {total})")
         for item in items:
             html_url = item.get("html_url", "")
             owner = item.get("repository", {}).get("owner", {}).get("login", "unknown")
@@ -748,10 +657,8 @@ def run_cycle(g):
     # ---- Search & extract ----
     all_candidates = []
     search_tasks = [
-        ("CODE",     lambda: search_code("CODE")),
-        ("ISSUES",   lambda: search_issues("ISSUES")),
-        ("COMMITS",  lambda: search_commits("COMMITS")),
-        ("ENV",      lambda: search_env_files("ENV")),
+        ("CODE", lambda: search_code()),
+        ("ENV",  lambda: search_env_files()),
     ]
 
     with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as executor:
