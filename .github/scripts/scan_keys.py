@@ -516,16 +516,16 @@ def verify_batch(batch):
 # ============================
 def generate_time_windows(lookback_minutes=CYCLE_LOOKBACK_MINUTES,
                          partition_minutes=CYCLE_PARTITION_MINUTES):
-    """Build (label, query_suffix) pairs for time-partitioned search."""
+    """Yield (label, start_iso, end_iso) for each time partition."""
     now = datetime.now(timezone.utc)
     windows = []
     for i in range(0, lookback_minutes, partition_minutes):
         end = now - timedelta(minutes=i)
         start = now - timedelta(minutes=i + partition_minutes)
         label = f"{start.strftime('%H:%M')}→{end.strftime('%H:%M')}"
-        # GitHub range syntax: qualifier:START..END  (no space after colon)
-        date_filter = f"{start.strftime('%Y-%m-%dT%H:%M')}..{end.strftime('%Y-%m-%dT%H:%M')}"
-        windows.append((label, date_filter))
+        start_iso = start.strftime('%Y-%m-%dT%H:%M')
+        end_iso = end.strftime('%Y-%m-%dT%H:%M')
+        windows.append((label, start_iso, end_iso))
     return windows
 
 def search_code(label):
@@ -563,8 +563,8 @@ def search_issues(label):
     """Search GitHub issues with time partition."""
     time_windows = generate_time_windows()
     total = 0
-    for _tw_label, date_filter in time_windows:
-        query = f"{ISSUE_KEYWORDS} created:{date_filter}"
+    for _label, start_iso, end_iso in time_windows:
+        query = f"{ISSUE_KEYWORDS} created:>={start_iso} created:<{end_iso}"
         page = 1
         consecutive_empty = 0
         while not stop_event.is_set() and consecutive_empty < 3:
@@ -596,8 +596,8 @@ def search_commits(label):
     """Search GitHub commits with time partition."""
     time_windows = generate_time_windows()
     total = 0
-    for _tw_label, date_filter in time_windows:
-        query = f"{COMMIT_KEYWORDS} committer-date:{date_filter}"
+    for _label, start_iso, end_iso in time_windows:
+        query = f"{COMMIT_KEYWORDS} committer-date:>={start_iso} committer-date:<{end_iso}"
         page = 1
         consecutive_empty = 0
         while not stop_event.is_set() and consecutive_empty < 3:
